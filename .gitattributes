@@ -1,0 +1,4 @@
+# Ensure LF line endings for shell scripts
+*.sh text eol=lf
+harrd text eol=lf
+install.sh text eol=lf

@@ -1,0 +1,558 @@
+#!/usr/bin/env bash
+set -u -o pipefail
+
+VERSION="3.1"
+
+cleanup() { echo; echo -e "${YELLOW}Interrompu.${RESET}"; exit 130; }
+trap cleanup INT TERM
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BLUE='\033[0;34m'; MAGENTA='\033[0;35m'
+BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+
+CONFIG_DIR="$HOME/.config/hardlink-tui"
+CONFIG_FILE="$CONFIG_DIR/config"
+LOG_FILE="$HOME/.hardlink-tui.log"
+
+DEFAULT_SRC="/media/raid/data/torrents"
+DEFAULT_DST="/media/raid/data"
+
+VIDEO_EXTS=( "*.mkv" "*.mp4" "*.avi" "*.mov" "*.webm" "*.m4v" "*.flv" "*.wmv" )
+SUB_EXTS=( "*.srt" "*.nfo" "*.ass" "*.sub" "*.idx" "*.vtt" )
+ALL_EXTS=( "${VIDEO_EXTS[@]}" "${SUB_EXTS[@]}" )
+
+DRYRUN="false"
+RECURSIVE="false"
+
+show_help() {
+    cat <<EOF
+Usage: harrd [OPTIONS]
+
+Outil de hardlink pour fichiers média.
+
+Options:
+  -h, --help      Afficher cette aide
+  -v, --version   Afficher la version
+EOF
+}
+
+case "${1:-}" in
+    -h|--help)    show_help; exit 0 ;;
+    -v|--version) echo "harrd v$VERSION"; exit 0 ;;
+    "")           ;;
+    *)            echo "Option inconnue: $1"; exit 1 ;;
+esac
+
+# ── Config ──────────────────────────────────────────────────────────
+
+load_config() {
+    SRC="$DEFAULT_SRC"
+    DST="$DEFAULT_DST"
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    while IFS='=' read -r key value; do
+        case "$key" in
+            ''|'#'*) continue ;;
+            SRC) SRC="${value//\"/}" ;;
+            DST) DST="${value//\"/}" ;;
+        esac
+    done < "$CONFIG_FILE"
+}
+
+save_config() {
+    mkdir -p "$CONFIG_DIR"
+    cat > "$CONFIG_FILE" <<EOF
+SRC="$SRC"
+DST="$DST"
+EOF
+}
+
+# ── Utilities ───────────────────────────────────────────────────────
+
+check_tools() {
+    command -v fzf >/dev/null || { echo -e "${RED}fzf n'est pas installé.${RESET}"; exit 1; }
+    command -v find >/dev/null || { echo -e "${RED}find n'est pas installé.${RESET}"; exit 1; }
+}
+
+log_action() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+rotate_log() {
+    local max_lines=100
+    if [[ -f "$LOG_FILE" ]] && (( $(wc -l < "$LOG_FILE") > max_lines )); then
+        local tmp="${LOG_FILE}.tmp"
+        tail -n "$max_lines" "$LOG_FILE" > "$tmp" && mv "$tmp" "$LOG_FILE"
+    fi
+}
+
+format_size() {
+    local bytes=$1
+    if (( bytes >= 1073741824 )); then
+        awk "BEGIN {printf \"%.2f GB\", $bytes/1073741824}"
+    elif (( bytes >= 1048576 )); then
+        awk "BEGIN {printf \"%.2f MB\", $bytes/1048576}"
+    else
+        echo "$bytes B"
+    fi
+}
+
+get_dir_size() {
+    du -sb "$1" 2>/dev/null | cut -f1
+}
+
+# Builds find args for extension matching via global _FIND_EXPR_ARGS
+_build_find_args() {
+    _FIND_EXPR_ARGS=()
+    local first=true
+    for ext in "$@"; do
+        if $first; then
+            first=false
+        else
+            _FIND_EXPR_ARGS+=(-o)
+        fi
+        _FIND_EXPR_ARGS+=(-iname "$ext")
+    done
+}
+
+# ── fzf preview ─────────────────────────────────────────────────────
+
+fzf_preview() {
+    local p="$1"
+    if [[ "$p" == ".." ]]; then
+        echo -e "\033[1;33m⬆ Dossier parent\033[0m"
+    elif [[ -d "$p" ]]; then
+        local size count
+        size=$(du -sh "$p" 2>/dev/null | cut -f1)
+        count=$(find "$p" -maxdepth 1 -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" \) 2>/dev/null | wc -l)
+        echo -e "\033[1;36m Dossier:\033[0m $p"
+        echo
+        echo -e "\033[1;33m📊 Taille:\033[0m $size"
+        echo
+        echo -e "\033[1;32m📂 Sous-dossiers:\033[0m"
+        find "$p" -maxdepth 1 -type d 2>/dev/null | tail -n +2 | sed "s|.*/||" | head -20 | sed "s|^|  • |"
+        echo
+        echo -e "\033[1;35m🎬 Fichiers vidéo:\033[0m"
+        find "$p" -maxdepth 1 -type f \( -iname "*.mkv" -o -iname "*.mp4" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.webm" \) 2>/dev/null | sed "s|.*/||" | head -20 | sed "s|^|  • |"
+        echo
+        echo -e "\033[1;34m📊 Total:\033[0m $count fichier(s) vidéo"
+    else
+        local size
+        size=$(du -sh "$p" 2>/dev/null | cut -f1)
+        echo -e "\033[1;35m📄 Fichier:\033[0m $p"
+        echo
+        echo -e "\033[1;33m📊 Taille:\033[0m $size"
+    fi
+}
+
+# ── Fuzzy pickers ───────────────────────────────────────────────────
+
+pick_dir_fuzzy() {
+    local start="${1:-/}"
+    local prompt="${2:-Choisir un dossier}"
+
+    find "$start" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
+    | sort -V \
+    | fzf \
+        --prompt="$prompt > " \
+        --height=50% \
+        --border=rounded \
+        --info=inline \
+        --header="↑↓ naviguer | TAB sélectionner | ENTRER confirmer | ESC annuler" \
+        --preview-window=right:50%:wrap \
+        --preview "fzf_preview {}"
+}
+
+pick_path() {
+    local start="${1:-/}"
+    local prompt="${2:-Chemin}"
+    local current="$start"
+
+    while true; do
+        local result
+        result=$(
+            {
+                echo ".."
+                find "$current" -mindepth 1 -maxdepth 1 2>/dev/null
+            } | sort -V \
+            | fzf \
+                --prompt="$prompt [$current] > " \
+                --height=50% \
+                --border=rounded \
+                --info=inline \
+                --header="↑↓ naviguer | .. = parent | TAB compléter | ENTRER entrer | Ctrl+Y accepter | ESC annuler" \
+                --bind="ctrl-y:accept" \
+                --preview-window=right:50%:wrap \
+                --preview "fzf_preview {}"
+        )
+
+        [[ -z "$result" ]] && return 1
+
+        if [[ "$result" == ".." ]]; then
+            [[ "$current" != "/" ]] && current=$(dirname "$current")
+            continue
+        fi
+
+        if [[ -d "$result" ]]; then
+            current="$result"
+        else
+            echo "$result"
+            return 0
+        fi
+    done
+}
+
+# ── Content detection ───────────────────────────────────────────────
+
+ensure_season_dir() {
+    local base_series_dir="$1"
+    local season_num="$2"
+    local season_dir
+    season_dir=$(printf "%s/Season %s" "$base_series_dir" "$season_num")
+    [[ -d "$season_dir" ]] || mkdir -p "$season_dir"
+    echo "$season_dir"
+}
+
+detect_content_type() {
+    local dirname
+    dirname=$(basename "$1")
+
+    if [[ "$dirname" =~ [Ss][0-9]{1,2}[Ee] ]] || \
+       [[ "$dirname" =~ [Ss][0-9]{1,2}[^Ee0-9] ]] || \
+       [[ "$dirname" =~ [Ss][0-9]{1,2}$ ]] || \
+       [[ "$dirname" =~ [Ss]aison ]] || \
+       [[ "$dirname" =~ [Ss]eason ]]; then
+        echo "series"
+    elif [[ "$dirname" =~ [0-9]{4}.*\.(1080|2160|720)[pP] ]] || \
+         [[ "$dirname" =~ [Bb]luray ]] || \
+         [[ "$dirname" =~ [Bb][Rr][Rr][Ee][Ss][Tt] ]] || \
+         [[ "$dirname" =~ [Bb][Ll][Uu][Rr][Aa][Yy] ]]; then
+        echo "film"
+    else
+        echo "unknown"
+    fi
+}
+
+extract_season_info() {
+    local dirname
+    dirname=$(basename "$1")
+    if [[ "$dirname" =~ [Ss]([0-9]{1,2}) ]]; then
+        echo "${BASH_REMATCH[1]}"
+    else
+        echo "01"
+    fi
+}
+
+extract_series_name() {
+    local dirname
+    dirname=$(basename "$1")
+    echo "$dirname" | sed -E 's/[[:space:]]*[Ss][0-9]{1,2}.*//; s/[._]/ /g; s/  */ /g; s/^ *//; s/ *$//'
+}
+
+check_disk_space() {
+    local src="$1"
+    local dst="$2"
+    local src_size dst_avail
+    src_size=$(get_dir_size "$src")
+    dst_avail=$(df -B1 --output=avail "$dst" 2>/dev/null | tail -1 | tr -d ' ')
+    if [[ -n "$src_size" && -n "$dst_avail" ]] && (( dst_avail < src_size )); then
+        echo -e "${YELLOW}⚠  Espace disque insuffisant${RESET}"
+        echo -e "   Besoin: $(format_size "$src_size") | Disponible: $(format_size "$dst_avail")"
+        return 1
+    fi
+    return 0
+}
+
+# ── Core ────────────────────────────────────────────────────────────
+
+show_progress() {
+    local current=$1 total=$2 width=40
+    local percentage=$((current * 100 / total))
+    local filled=$((current * width / total))
+    local empty=$((width - filled))
+    printf "\r  ["
+    printf "%${filled}s" | tr ' ' '█'
+    printf "%${empty}s" | tr ' ' '░'
+    printf "] %3d%% (%d/%d)" "$percentage" "$current" "$total"
+    (( current == total )) && printf "\n"
+}
+
+count_files() {
+    local dir="$1"
+    local recursive="${2:-false}"
+    local depth_args=(-maxdepth 1 -type f)
+    [[ "$recursive" == "true" ]] && depth_args=(-type f)
+    _build_find_args "${ALL_EXTS[@]}"
+    find "$dir" "${depth_args[@]}" \( "${_FIND_EXPR_ARGS[@]}" \) 2>/dev/null | wc -l
+}
+
+do_hardlink() {
+    local src="$1" dst="$2" recursive="$3" dryrun="$4"
+
+    mkdir -p "$dst"
+
+    local depth_args=(-maxdepth 1 -type f)
+    [[ "$recursive" == "true" ]] && depth_args=(-type f)
+    _build_find_args "${ALL_EXTS[@]}"
+
+    local ok=0 skip=0 err=0 total=0 current=0
+    total=$(count_files "$src" "$recursive")
+
+    if [[ $total -eq 0 ]]; then
+        echo -e "  ${YELLOW}Aucun fichier trouvé.${RESET}"
+        return
+    fi
+
+    echo -e "  ${DIM}Traitement de $total fichier(s)...${RESET}"
+    echo
+
+    while IFS= read -r -d '' file; do
+        local fname dst_file
+        fname=$(basename "$file")
+        dst_file="$dst/$fname"
+        ((current++))
+
+        if [[ -e "$dst_file" ]]; then
+            echo -e "  ${DIM}[SKIP]${RESET} $fname"
+            ((skip++))
+        elif [[ "$dryrun" == "true" ]]; then
+            echo -e "  ${CYAN}[DRY]${RESET}  $fname"
+            ((ok++))
+        else
+            if ln "$file" "$dst_file" 2>/dev/null; then
+                echo -e "  ${GREEN}[OK]${RESET}   $fname"
+                ((ok++))
+            else
+                echo -e "  ${RED}[ERREUR]${RESET} $fname"
+                ((err++))
+            fi
+        fi
+
+        show_progress $current $total
+    done < <(
+        find "$src" "${depth_args[@]}" \( "${_FIND_EXPR_ARGS[@]}" \) \
+            -print0 | sort -Vz
+    )
+
+    echo
+    echo -e "  ${BOLD}Résultat :${RESET} ${GREEN}$ok liés${RESET} | ${DIM}$skip ignorés${RESET} | ${RED}$err erreurs${RESET}"
+    log_action "hardlink: $src -> $dst | OK:$ok SKIP:$skip ERR:$err"
+    rotate_log
+}
+
+resolve_destination() {
+    local src_picked="$1"
+    local dst_picked="$2"
+    local content_type="$3"
+
+    if [[ "$content_type" == "series" ]]; then
+        local season series_name
+        season=$(extract_season_info "$src_picked")
+        series_name=$(extract_series_name "$src_picked")
+
+        echo -e "${DIM}Série détectée : $series_name (Saison $season)${RESET}" >&2
+        read -rp "$(echo -e "${YELLOW}Nom de la série [$series_name] : ${RESET}")" custom_name
+        series_name="${custom_name:-$series_name}"
+        read -rp "$(echo -e "${YELLOW}Numéro de saison [$season] : ${RESET}")" custom_season
+        season="${custom_season:-$season}"
+
+        local base="$dst_picked"
+        [[ "$base" != */series ]] && base="$base/series"
+        [[ "$base" != */"$series_name" ]] && base="$base/$series_name"
+        ensure_season_dir "$base" "$season"
+
+    elif [[ "$content_type" == "film" ]]; then
+        local film_name
+        film_name=$(basename "$src_picked")
+        read -rp "$(echo -e "${YELLOW}Nom du film [$film_name] : ${RESET}")" custom_name
+        film_name="${custom_name:-$film_name}"
+
+        local base="$dst_picked"
+        [[ "$base" != */films ]] && base="$base/films"
+        local film_dir="$base/$film_name"
+        [[ -d "$film_dir" ]] || mkdir -p "$film_dir"
+        echo "$film_dir"
+    else
+        local dirname title year
+        dirname=$(basename "$src_picked")
+
+        year=""
+        if [[ "$dirname" =~ ([0-9]{4}) ]]; then
+            year="${BASH_REMATCH[1]}"
+        fi
+
+        if [[ -n "$year" ]]; then
+            title=$(echo "$dirname" | sed -E "s/[\.\ ]*${year}.*//; s/[._]/ /g; s/  */ /g; s/^ *//; s/ *$//")
+            [[ -z "$title" ]] && title="$dirname"
+            title="$title ($year)"
+        else
+            title="$dirname"
+        fi
+
+        echo -e "${DIM}Contenu détecté : $title${RESET}" >&2
+        read -rp "$(echo -e "${YELLOW}Nom du dossier [$title] : ${RESET}")" custom_name
+        title="${custom_name:-$title}"
+
+        local content_dir="$dst_picked/$title"
+        [[ -d "$content_dir" ]] || mkdir -p "$content_dir"
+        echo "$content_dir"
+    fi
+}
+
+# ── UI ──────────────────────────────────────────────────────────────
+
+show_menu() {
+    clear
+    echo -e "${CYAN}"
+    echo "  ╔══════════════════════════════════════════════════╗"
+    echo "  ║                                                  ║"
+    echo "  ║  ╭━━━╮╭━━━╮╭━━━╮   H A R R D    ╭━━━╮╭━━━╮╭━━━╮  ║"
+    echo "  ║  │ ◉ ││ ◉ ││ ◉ │                │ ◉ ││ ◉ ││ ◉ │  ║"
+    echo "  ║  ╰━━━╯╰━━━╯╰━━━╯   H A R R D    ╰━━━╯╰━━━╯╰━━━╯  ║"
+    echo "  ║                                                  ║"
+    echo "  ╚══════════════════════════════════════════════════╝"
+    echo -e "${RESET}"
+    echo
+    echo -e "  ${DIM}Source      :${RESET} ${BOLD}$SRC${RESET}"
+    echo -e "  ${DIM}Destination :${RESET} ${BOLD}$DST${RESET}"
+    echo
+    echo -e "  ${GREEN}[1]${RESET} Lancer le hardlink"
+    echo -e "  ${YELLOW}[2]${RESET} Modifier les chemins"
+    echo -e "  ${RED}[3]${RESET} Quitter"
+    echo
+    echo -e "  ${DIM}Options :${RESET}"
+    echo -e "    Dry-run   : ${BOLD}$DRYRUN${RESET}"
+    echo -e "    Récursif  : ${BOLD}$RECURSIVE${RESET}"
+    echo -e "    ${DIM}[d] basculer dry-run | [r] basculer récursif${RESET}"
+    echo
+}
+
+# ── Main ────────────────────────────────────────────────────────────
+
+main() {
+    check_tools
+    load_config
+
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        echo -e "${BOLD}Premier lancement — configuration${RESET}"
+        echo
+        echo -e "${DIM}Utilisez TAB pour la complétion, ↑↓ pour l'historique${RESET}"
+        echo
+        read -e -rp "$(echo -e "${YELLOW}Chemin source [${DEFAULT_SRC}] : ${RESET}")" SRC
+        SRC="${SRC:-$DEFAULT_SRC}"
+        read -e -rp "$(echo -e "${YELLOW}Chemin destination [${DEFAULT_DST}] : ${RESET}")" DST
+        DST="${DST:-$DEFAULT_DST}"
+        save_config
+    fi
+
+    while true; do
+        show_menu
+        read -rp "$(echo -e "${YELLOW}Choix [1] : ${RESET}")" choice
+        choice="${choice:-1}"
+
+        case "$choice" in
+            d)
+                DRYRUN=$( [[ "$DRYRUN" == "false" ]] && echo "true" || echo "false" )
+                ;;
+            r)
+                RECURSIVE=$( [[ "$RECURSIVE" == "false" ]] && echo "true" || echo "false" )
+                ;;
+            1)
+                if [[ ! -d "$SRC" ]]; then
+                    echo -e "${RED}Le dossier source n'existe pas : $SRC${RESET}"
+                    echo -e "${DIM}Appuyez sur Entrée pour revenir au menu...${RESET}"
+                    read -r
+                    continue
+                fi
+
+                echo
+                echo -e "${BOLD}Sélection du dossier source${RESET}"
+                SRC_PICKED=$(pick_dir_fuzzy "$SRC" "Source" "")
+                [[ -z "$SRC_PICKED" ]] && continue
+
+                echo
+                echo -e "${BOLD}Sélection du dossier destination${RESET}"
+                DST_PICKED=$(pick_dir_fuzzy "$DST" "Destination" "")
+                [[ -z "$DST_PICKED" ]] && continue
+
+                local content_type
+                content_type=$(detect_content_type "$SRC_PICKED")
+                echo -e "${DIM}Type détecté : ${BOLD}${CYAN}$content_type${RESET}"
+
+                local final_dst
+                if [[ "$content_type" != "unknown" ]]; then
+                    final_dst=$(resolve_destination "$SRC_PICKED" "$DST_PICKED" "$content_type")
+                else
+                    final_dst="$DST_PICKED"
+                fi
+
+                if ! check_disk_space "$SRC_PICKED" "$final_dst"; then
+                    read -rp "$(echo -e "${YELLOW}Continuer quand même ? [o/N] ${RESET}")" force
+                    [[ ! "$force" =~ ^[oO]$ ]] && continue
+                fi
+
+                echo
+                echo -e "  ${BOLD}Source       :${RESET} $SRC_PICKED"
+                echo -e "  ${BOLD}Destination  :${RESET} $final_dst"
+                echo -e "  ${BOLD}Opération    :${RESET} hardlink"
+                echo -e "  ${BOLD}Dry-run      :${RESET} $DRYRUN"
+                echo -e "  ${BOLD}Récursif     :${RESET} $RECURSIVE"
+                echo
+
+                read -rp "$(echo -e "${BOLD}${GREEN}Lancer ? [O/n] ${RESET}")" go
+                [[ "$go" =~ ^[nN]$ ]] && continue
+
+                do_hardlink "$SRC_PICKED" "$final_dst" "$RECURSIVE" "$DRYRUN"
+
+                if [[ "$DRYRUN" == "true" ]]; then
+                    echo
+                    read -rp "$(echo -e "${BOLD}${YELLOW}Exécuter pour de vrai maintenant ? [O/n] ${RESET}")" exec_real
+                    if [[ ! "$exec_real" =~ ^[nN]$ ]]; then
+                        echo -e "${BOLD}Exécution réelle...${RESET}"
+                        do_hardlink "$SRC_PICKED" "$final_dst" "$RECURSIVE" "false"
+                    fi
+                fi
+
+                echo -e "${GREEN}${BOLD}Terminé.${RESET}"
+                echo -e "${DIM}Log : $LOG_FILE${RESET}"
+                echo -e "${DIM}Appuyez sur Entrée...${RESET}"
+                read -r
+                ;;
+            2)
+                echo
+                echo -e "${BOLD}Modification des chemins${RESET}"
+                echo -e "${DIM}Navigation visuelle avec fzf${RESET}"
+                echo
+                echo -e "${YELLOW}Nouveau chemin source :${RESET}"
+                local new_src
+                new_src=$(pick_path "$SRC" "Source")
+                if [[ -n "$new_src" ]]; then
+                    SRC="$new_src"
+                else
+                    echo -e "${DIM}Inchangé : $SRC${RESET}"
+                fi
+                echo
+                echo -e "${YELLOW}Nouveau chemin destination :${RESET}"
+                local new_dst
+                new_dst=$(pick_path "$DST" "Destination")
+                if [[ -n "$new_dst" ]]; then
+                    DST="$new_dst"
+                else
+                    echo -e "${DIM}Inchangé : $DST${RESET}"
+                fi
+                save_config
+                echo -e "${GREEN}Configuration sauvegardée.${RESET}"
+                echo -e "${DIM}Appuyez sur Entrée...${RESET}"
+                read -r
+                ;;
+            3)
+                echo -e "${YELLOW}Au revoir.${RESET}"
+                exit 0
+                ;;
+            *)
+                continue
+                ;;
+        esac
+    done
+}
+
+main
