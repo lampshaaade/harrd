@@ -50,6 +50,7 @@ load_config() {
     DST="$DEFAULT_DST"
     [[ -f "$CONFIG_FILE" ]] || return 0
     while IFS='=' read -r key value; do
+        key="${key// /}"  # strip spaces from key
         case "$key" in
             ''|'#'*) continue ;;
             SRC) SRC="${value//\"/}" ;;
@@ -273,7 +274,7 @@ show_progress() {
     printf "%${filled}s" | tr ' ' '█'
     printf "%${empty}s" | tr ' ' '░'
     printf "] %3d%% (%d/%d)" "$percentage" "$current" "$total"
-    (( current == total )) && printf "\n"
+    [[ $current -eq $total ]] && printf "\n"
 }
 
 count_files() {
@@ -309,21 +310,21 @@ do_hardlink() {
         local fname dst_file
         fname=$(basename "$file")
         dst_file="$dst/$fname"
-        ((current++))
+        current=$((current + 1))
 
         if [[ -e "$dst_file" ]]; then
             echo -e "  ${DIM}[SKIP]${RESET} $fname"
-            ((skip++))
+            skip=$((skip + 1))
         elif [[ "$dryrun" == "true" ]]; then
             echo -e "  ${CYAN}[DRY]${RESET}  $fname"
-            ((ok++))
+            ok=$((ok + 1))
         else
             if ln "$file" "$dst_file" 2>/dev/null; then
                 echo -e "  ${GREEN}[OK]${RESET}   $fname"
-                ((ok++))
+                ok=$((ok + 1))
             else
                 echo -e "  ${RED}[ERREUR]${RESET} $fname"
-                ((err++))
+                err=$((err + 1))
             fi
         fi
 
@@ -348,6 +349,7 @@ resolve_destination() {
         local season series_name
         season=$(extract_season_info "$src_picked")
         series_name=$(extract_series_name "$src_picked")
+        [[ -z "$series_name" ]] && series_name=$(basename "$src_picked")
 
         echo -e "${DIM}Série détectée : $series_name (Saison $season)${RESET}" >&2
         read -rp "$(echo -e "${YELLOW}Nom de la série [$series_name] : ${RESET}")" custom_name
